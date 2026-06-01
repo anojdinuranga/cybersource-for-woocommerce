@@ -12,7 +12,7 @@
 	var decode = window.wp.htmlEntities.decodeEntities;
 	var createElement = window.wp.element.createElement;
 
-	var label = decode( settings.title ) || 'Credit/Debit Card';
+	var label = decode( settings.title || 'Credit/Debit Card' );
 
 	var Content = function () {
 		return decode( settings.description || '' );

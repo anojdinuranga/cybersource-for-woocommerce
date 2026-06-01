@@ -142,6 +142,7 @@ function hcp_wc_init() {
 			$this->init_form_fields();
 			$this->init_settings();
 
+			$this->enabled          = $this->get_option( 'enabled' );
 			$this->title            = $this->get_option( 'title' );
 			$this->description      = $this->get_option( 'description' );
 			$this->profile_id       = $this->get_option( 'profile_id' );
@@ -173,6 +174,19 @@ function hcp_wc_init() {
 			add_action( 'woocommerce_update_options_payment_gateways_' . $this->id, array( $this, 'process_admin_options' ) );
 			add_action( 'woocommerce_receipt_' . $this->id, array( $this, 'receipt_page' ) );
 			add_action( 'woocommerce_api_' . $this->id, array( $this, 'check_response' ) );
+		}
+
+		/**
+		 * Only show the gateway when the required credentials are present.
+		 *
+		 * @return bool
+		 */
+		public function is_available() {
+			return parent::is_available()
+				&& '' !== trim( (string) $this->profile_id )
+				&& '' !== trim( (string) $this->access_key )
+				&& '' !== trim( (string) $this->secret_key )
+				&& '' !== trim( (string) $this->endpoint );
 		}
 
 		/* ------------------------------------------------------------------ */
@@ -305,6 +319,16 @@ function hcp_wc_init() {
 
 		public function process_payment( $order_id ) {
 			$order = wc_get_order( $order_id );
+			if ( ! $order ) {
+				wc_add_notice( __( 'Invalid order. Please try again.', 'hosted-card-payments-for-woocommerce' ), 'error' );
+				return array( 'result' => 'failure' );
+			}
+
+			if ( ! $this->is_available() ) {
+				wc_add_notice( __( 'This payment method is not fully configured. Please contact the store owner.', 'hosted-card-payments-for-woocommerce' ), 'error' );
+				return array( 'result' => 'failure' );
+			}
+
 			return array(
 				'result'   => 'success',
 				'redirect' => $order->get_checkout_payment_url( true ),
@@ -324,6 +348,13 @@ function hcp_wc_init() {
 		public function generate_payment_form( $order_id ) {
 
 			$order = wc_get_order( $order_id );
+			if ( ! $order ) {
+				return '<p>' . esc_html__( 'Invalid order. Please try again.', 'hosted-card-payments-for-woocommerce' ) . '</p>';
+			}
+
+			if ( ! $this->is_available() ) {
+				return '<p>' . esc_html__( 'This payment method is not fully configured. Please contact the store owner.', 'hosted-card-payments-for-woocommerce' ) . '</p>';
+			}
 
 			$amount   = number_format( (float) $order->get_total(), 2, '.', '' );
 			$currency = $order->get_currency();
@@ -387,10 +418,10 @@ function hcp_wc_init() {
 		public function check_response() {
 
 			// CyberSource posts back form-encoded data. Authenticity is established by
-			// the HMAC signature below — not by a WP nonce — so we read the raw params.
+			// the HMAC signature below - not by a WP nonce - so we read the raw params.
 			$params = ! empty( $_POST ) ? wp_unslash( $_POST ) : wp_unslash( $_GET ); // phpcs:ignore WordPress.Security.NonceVerification.Missing, WordPress.Security.NonceVerification.Recommended
 
-			$order_id = isset( $params['req_reference_number'] ) ? absint( $params['req_reference_number'] ) : 0;
+			$order_id = absint( $this->scalar_param( $params, 'req_reference_number' ) );
 			$order    = $order_id ? wc_get_order( $order_id ) : false;
 
 			if ( ! $order ) {
@@ -412,8 +443,8 @@ function hcp_wc_init() {
 			);
 
 			$verified = $this->verify_response( $params );
-			$decision = isset( $params['decision'] ) ? strtoupper( sanitize_text_field( $params['decision'] ) ) : 'ERROR';
-			$receipt  = isset( $params['transaction_id'] ) ? sanitize_text_field( $params['transaction_id'] ) : '';
+			$decision = strtoupper( sanitize_text_field( $this->scalar_param( $params, 'decision', 'ERROR' ) ) );
+			$receipt  = sanitize_text_field( $this->scalar_param( $params, 'transaction_id' ) );
 
 			// Defence in depth: even with a valid signature, confirm the amount and
 			// currency match the order, so a misconfigured profile cannot under-charge.
@@ -422,12 +453,12 @@ function hcp_wc_init() {
 			$authorised = ( $verified && 'ACCEPT' === $decision && $amount_ok );
 
 			if ( $authorised ) {
-				if ( ! $order->has_status( array( 'completed', 'processing' ) ) ) {
-					$msg = array(
-						'class'   => 'success',
-						'message' => $success_message,
-					);
+				$msg = array(
+					'class'   => 'success',
+					'message' => $success_message,
+				);
 
+				if ( ! $order->has_status( array( 'completed', 'processing' ) ) ) {
 					$order->payment_complete( $receipt );
 					$order->add_order_note(
 						sprintf(
@@ -450,30 +481,41 @@ function hcp_wc_init() {
 					 * @param array    $params Raw response params from CyberSource.
 					 */
 					do_action( 'hcp_wc_payment_complete', $order, $params );
+				} else {
+					$this->log( sprintf( 'Verified duplicate payment response ignored for already paid order #%d.', $order->get_id() ) );
 				}
 			} else {
 				if ( ! $verified ) {
-					$note = __( 'Payment response signature verification FAILED — possible tampering.', 'hosted-card-payments-for-woocommerce' );
+					$note = __( 'Payment response signature verification FAILED - possible tampering.', 'hosted-card-payments-for-woocommerce' );
+					$this->log( sprintf( 'Unsigned or invalid payment response rejected for order #%d.', $order->get_id() ), 'error' );
 				} elseif ( ! $amount_ok ) {
-					$note = __( 'Payment amount/currency mismatch — rejected.', 'hosted-card-payments-for-woocommerce' );
+					$note = __( 'Payment amount/currency mismatch - rejected.', 'hosted-card-payments-for-woocommerce' );
 				} else {
 					$note = sprintf(
 						/* translators: 1: decision 2: reason code */
 						__( 'Payment not approved. Decision: %1$s (reason %2$s)', 'hosted-card-payments-for-woocommerce' ),
 						$decision,
-						isset( $params['reason_code'] ) ? sanitize_text_field( $params['reason_code'] ) : '?'
+						sanitize_text_field( $this->scalar_param( $params, 'reason_code', '?' ) )
 					);
 				}
-				$order->update_status( 'failed', $note );
-				$this->log( sprintf( 'Order #%d failed: %s', $order->get_id(), $note ), 'error' );
 
-				/**
-				 * Fires when a payment is not accepted (declined, unverified or mismatched).
-				 *
-				 * @param WC_Order $order  The order.
-				 * @param array    $params Raw response params from CyberSource.
-				 */
-				do_action( 'hcp_wc_payment_failed', $order, $params );
+				if ( $verified ) {
+					if ( $order->has_status( array( 'completed', 'processing' ) ) ) {
+						$order->add_order_note( $note );
+					} else {
+						$order->update_status( 'failed', $note );
+					}
+
+					$this->log( sprintf( 'Order #%d failed: %s', $order->get_id(), $note ), 'error' );
+
+					/**
+					 * Fires when a verified payment response is not accepted.
+					 *
+					 * @param WC_Order $order  The order.
+					 * @param array    $params Raw response params from CyberSource.
+					 */
+					do_action( 'hcp_wc_payment_failed', $order, $params );
+				}
 			}
 
 			if ( function_exists( 'wc_add_notice' ) ) {
@@ -492,23 +534,32 @@ function hcp_wc_init() {
 		 * Confirm the signed amount and currency in the response match the order.
 		 */
 		private function amount_matches( $order, array $params ) {
-			if ( ! isset( $params['req_amount'], $params['req_currency'] ) ) {
+			$req_amount   = $this->scalar_param( $params, 'req_amount', null );
+			$req_currency = $this->scalar_param( $params, 'req_currency', null );
+
+			if ( null === $req_amount || null === $req_currency ) {
 				return false;
 			}
+
 			$expected_amount   = number_format( (float) $order->get_total(), 2, '.', '' );
 			$expected_currency = strtoupper( $order->get_currency() );
-			$got_amount        = number_format( (float) $params['req_amount'], 2, '.', '' );
-			$got_currency      = strtoupper( sanitize_text_field( $params['req_currency'] ) );
+			$got_amount        = number_format( (float) $req_amount, 2, '.', '' );
+			$got_currency      = strtoupper( sanitize_text_field( $req_currency ) );
 
 			return hash_equals( $expected_amount, $got_amount ) && hash_equals( $expected_currency, $got_currency );
 		}
 
 		private function build_data_to_sign( array $params, $signed_field_names ) {
-			$names = explode( ',', $signed_field_names );
+			if ( ! is_scalar( $signed_field_names ) ) {
+				return '';
+			}
+
+			$names = explode( ',', (string) $signed_field_names );
 			$pairs = array();
 			foreach ( $names as $name ) {
 				$name    = trim( $name );
 				$value   = array_key_exists( $name, $params ) ? $params[ $name ] : '';
+				$value   = is_scalar( $value ) ? (string) $value : '';
 				$pairs[] = $name . '=' . $value;
 			}
 			return implode( ',', $pairs );
@@ -523,11 +574,31 @@ function hcp_wc_init() {
 		}
 
 		private function verify_response( array $params ) {
-			if ( empty( $params['signed_field_names'] ) || ! isset( $params['signature'] ) ) {
+			$signed_field_names = $this->scalar_param( $params, 'signed_field_names' );
+			$signature          = $this->scalar_param( $params, 'signature', null );
+
+			if ( '' === $signed_field_names || null === $signature ) {
 				return false;
 			}
-			$expected = $this->sign( $this->build_data_to_sign( $params, $params['signed_field_names'] ) );
-			return hash_equals( $expected, (string) $params['signature'] );
+
+			$expected = $this->sign( $this->build_data_to_sign( $params, $signed_field_names ) );
+			return hash_equals( $expected, $signature );
+		}
+
+		/**
+		 * Read a scalar gateway parameter without letting array input cause warnings.
+		 *
+		 * @param array  $params  Raw request parameters.
+		 * @param string $key     Parameter name.
+		 * @param mixed  $default Default value when the parameter is missing or not scalar.
+		 * @return mixed
+		 */
+		private function scalar_param( array $params, $key, $default = '' ) {
+			if ( ! array_key_exists( $key, $params ) || ! is_scalar( $params[ $key ] ) ) {
+				return $default;
+			}
+
+			return (string) $params[ $key ];
 		}
 
 		/**
@@ -581,55 +652,55 @@ add_action(
 		// Guard against re-declaration if the hook fires more than once.
 		if ( ! class_exists( 'Hosted_Card_Payments_WC_Blocks_Support' ) ) {
 
-		/**
-		 * Registers the gateway with the Cart/Checkout blocks.
-		 */
-		final class Hosted_Card_Payments_WC_Blocks_Support extends \Automattic\WooCommerce\Blocks\Payment\Integrations\AbstractPaymentMethodType {
+			/**
+			 * Registers the gateway with the Cart/Checkout blocks.
+			 */
+			final class Hosted_Card_Payments_WC_Blocks_Support extends \Automattic\WooCommerce\Blocks\Payment\Integrations\AbstractPaymentMethodType {
 
-			/** @var string Must match the gateway id. */
-			protected $name = 'hosted_card_payments';
+				/** @var string Must match the gateway id. */
+				protected $name = 'hosted_card_payments';
 
-			public function initialize() {
-				$this->settings = get_option( 'woocommerce_hosted_card_payments_settings', array() );
-			}
-
-			public function is_active() {
-				return ! empty( $this->settings['enabled'] ) && 'yes' === $this->settings['enabled'];
-			}
-
-			public function get_payment_method_script_handles() {
-				$handle = 'hosted-card-payments-blocks';
-
-				wp_register_script(
-					$handle,
-					plugins_url( 'assets/js/blocks.js', HCP_WC_FILE ),
-					array( 'wc-blocks-registry', 'wp-element', 'wp-html-entities', 'wc-settings' ),
-					HCP_WC_VERSION,
-					true
-				);
-
-				if ( function_exists( 'wp_set_script_translations' ) ) {
-					wp_set_script_translations( $handle, 'hosted-card-payments-for-woocommerce' );
+				public function initialize() {
+					$this->settings = get_option( 'woocommerce_hosted_card_payments_settings', array() );
 				}
 
-				return array( $handle );
-			}
-
-			public function get_payment_method_data() {
-				$icon      = '';
-				$icon_file = plugin_dir_path( HCP_WC_FILE ) . 'assets/images/card-logo.png';
-				if ( file_exists( $icon_file ) ) {
-					$icon = plugins_url( 'assets/images/card-logo.png', HCP_WC_FILE );
+				public function is_active() {
+					return ! empty( $this->settings['enabled'] ) && 'yes' === $this->settings['enabled'];
 				}
 
-				return array(
-					'title'       => isset( $this->settings['title'] ) ? $this->settings['title'] : 'Credit/Debit Card',
-					'description' => isset( $this->settings['description'] ) ? $this->settings['description'] : '',
-					'icon'        => $icon,
-					'supports'    => array( 'products' ),
-				);
+				public function get_payment_method_script_handles() {
+					$handle = 'hosted-card-payments-blocks';
+
+					wp_register_script(
+						$handle,
+						plugins_url( 'assets/js/blocks.js', HCP_WC_FILE ),
+						array( 'wc-blocks-registry', 'wp-element', 'wp-html-entities', 'wc-settings' ),
+						HCP_WC_VERSION,
+						true
+					);
+
+					if ( function_exists( 'wp_set_script_translations' ) ) {
+						wp_set_script_translations( $handle, 'hosted-card-payments-for-woocommerce' );
+					}
+
+					return array( $handle );
+				}
+
+				public function get_payment_method_data() {
+					$icon      = '';
+					$icon_file = plugin_dir_path( HCP_WC_FILE ) . 'assets/images/card-logo.png';
+					if ( file_exists( $icon_file ) ) {
+						$icon = plugins_url( 'assets/images/card-logo.png', HCP_WC_FILE );
+					}
+
+					return array(
+						'title'       => isset( $this->settings['title'] ) ? $this->settings['title'] : 'Credit/Debit Card',
+						'description' => isset( $this->settings['description'] ) ? $this->settings['description'] : '',
+						'icon'        => $icon,
+						'supports'    => array( 'products' ),
+					);
+				}
 			}
-		}
 
 		} // class_exists guard.
 
