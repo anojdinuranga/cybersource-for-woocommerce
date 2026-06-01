@@ -1,0 +1,29 @@
+# --- Secrets: never commit these ---
+config.php
+accessKey.txt
+keySecret.txt
+*.key
+*.pem
+.env
+.env.*
+
+# --- Dependencies / build ---
+/vendor/
+/node_modules/
+composer.lock
+package-lock.json
+
+# --- Build artifacts ---
+*.zip
+/build/
+/dist/
+
+# --- Editor / OS ---
+.idea/
+.vscode/
+*.sublime-*
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
